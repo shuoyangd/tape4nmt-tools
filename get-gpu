@@ -1,0 +1,75 @@
+#! /bin/sh
+#
+# get-gpu.sh
+# Copyright (C) 2020 hiaoxui
+#
+# This script will call nvidia-smi and look through the usage
+# of gpus on that host, grab a free one, and set your
+# CUDA_VISIBLE_DEVICES variable for you, so you don't accidentally
+# run into another person's GPU under a shared host setting.
+#
+# Added file lock capability so you can safely run simultaneous
+# jobs without them crashing into each other.
+#
+# Usage:
+#   get-gpu  %% return 1 gpu by default
+#   get-gpu 4  %% return 4 gpus
+#
+# Modified from "free-gpu" script written by Gaurav Kumar.
+#
+# Distributed under terms of the MIT license.
+#
+
+LOCK_DIR="$HOME/.lock"
+mkdir -p "$LOCK_DIR"
+if [ ! -f "$LOCK_DIR/master.lock" ]; then
+  touch "$LOCK_DIR/master.lock"
+fi
+exec 3>"$LOCK_DIR/master.lock"
+# echo "Trying to acqure master lock"
+flock -x 3
+
+N_GPU=$(nvidia-smi -L | wc -l)
+echo "Number of GPUs: $N_GPU"
+
+FREE_GPU=$(nvidia-smi | sed -e '1,/Processes/d' \
+  | tail -n+3 | head -n-1 | awk '{print $2}'\
+  | awk -v ng="$N_GPU" 'BEGIN{for (n=0;n<ng;++n){g[n] = 1}} {delete g[$1];} END{for (i in g) print i}')
+
+for DEVICE_ID in $(seq 0 $(($N_GPU - 1))); do
+  TMP_LOCK="$LOCK_DIR/$(cat /etc/hostname).$DEVICE_ID.lock"
+  if [ ! -f "$TMP_LOCK" ]; then
+    touch "$TMP_LOCK"
+  fi
+  exec 4>"$TMP_LOCK"
+  if ! flock -xn 4 ; then
+    echo "BUSY: $DEVICE_ID"
+    FREE_GPU=$(sed "/$DEVICE_ID/d" <<< "$FREE_GPU")
+  fi
+  exec 4>&-
+done
+
+echo "Free GPUs: " $FREE_GPU
+
+REQUEST_N=$1
+if [ -z "$REQUEST_N" ] ; then
+  REQUEST_N=1
+fi
+SELECTED_DEVICES=$(head -n $REQUEST_N <<< "$FREE_GPU")
+CUDA_VISIBLE_DEVICES=""
+
+CUR_FN=5
+
+for DEVICE in $SELECTED_DEVICES; do
+  echo "Select device: $DEVICE"
+  LOCK="$LOCK_DIR/$(cat /etc/hostname).$DEVICE.lock"
+  touch "$LOCK"
+  eval "exec ${CUR_FN}> $LOCK"
+  eval "flock -x ${CUR_FN}"
+  CUDA_VISIBLE_DEVICES+="$DEVICE,"
+  CUR_FN=$(($CUR_FN+1))
+done
+
+export CUDA_VISIBLE_DEVICES
+
+exec 3>&-
